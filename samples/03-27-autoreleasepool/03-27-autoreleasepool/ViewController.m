@@ -7,6 +7,7 @@
 //
 
 #import "ViewController.h"
+#include <mach/exception_types.h>
 
 static void RunLoopObserverCallBack(CFRunLoopObserverRef observer, CFRunLoopActivity activity, void *info) {
     NSLog(@"activity:%d",activity);
@@ -51,6 +52,7 @@ __weak id obj;
     [NSTimer scheduledTimerWithTimeInterval:5 target:self selector:@selector(testAction) userInfo:nil repeats:YES];
     [loop run];
     NSLog(@"thread ending");
+    
 }
 
 - (void)testAction{
