@@ -1091,16 +1091,179 @@ XXShield 在 dealloc 中也做了类似将多余观察者移除掉的操作，�
 > *  [JackLee18](https://github.com/JackLee18) / **[JKCrashProtect](https://github.com/JackLee18/JKCrashProtect)**（第三方框架）
 > * [大白健康系统 -- iOS APP运行时 Crash 自动修复系统](https://neyoufan.github.io/2017/01/13/ios/BayMax_HTSafetyGuard)
 
-# Block
+# Block(初版)
 
 1. `block`的内部实现，结构体是什么样的
+
+   block 也是一个对象，主要分为 Imp 结构体 和 Desc 结构体，用 `clang -rewrite-objc` 命令将 oc 代码重写成 c++:
+
+   ```c++
+   struct __block_impl {
+     void *isa;
+     int Flags;
+     int Reserved;
+     void *FuncPtr;
+   };
+   
+   struct __main_block_impl_0 {
+     struct __block_impl impl;
+     struct __main_block_desc_0* Desc;
+     __main_block_impl_0(void *fp, struct __main_block_desc_0 *desc, int flags=0) {
+       impl.isa = &_NSConcreteStackBlock;
+       impl.Flags = flags;
+       impl.FuncPtr = fp;
+       Desc = desc;
+     }
+   };
+   ```
+
+   > 重写c++只是帮助我们理解，实际实现还是有偏差的，转成 IR 是不是更好呢？
+
 2. block是类吗，有哪些类型
+
+   一般，block有三种：_NSConcreteGlobalBlock、_NSConcreteStackBlock、_NSConcreteMallocBlock，根据Block对象创建时所处数据区不同而进行区别。
+
+   1. 栈上 Block，引用了栈上变量，生命周期由系统控制的，一旦所属作用域结束，就被系统销毁了。
+   2. 堆上 Block，使用 copy 或者 strong（ARC）下就从栈Block 拷贝到堆上。
+   3. 全局 Block，未引用任何栈上变量时就是全局Block;
+
 3. 一个`int`变量被 `__block` 修饰与否的区别？block的变量截获
+
+   值 copy 和指针 copy，`__block` 修饰的话允许在 block 内部修改变量，因为传入的是 int变量的指针。
+
+   外部变量有四种类型：自动变量、静态变量、静态全局变量、全局变量。
+
+   全局变量和静态全局变量在 block 中是直接引用的，不需要通过结构去传入指针；
+
+   函数/方法中的 static 静态变量是直接在block中保存了指针，如下测试代码：
+
+   ```c++
+   int a = 1;
+   static int b = 2;
+   
+   int main(int argc, const char * argv[]) {
+   
+       int c = 3;
+       static int d = 4;
+       NSMutableString *str = [[NSMutableString alloc]initWithString:@"hello"];
+       void (^blk)(void) = ^{
+           a++;
+           b++;
+           d++;
+           [str appendString:@"world"];
+           NSLog(@"1----------- a = %d,b = %d,c = %d,d = %d,str = %@",a,b,c,d,str);
+       };
+       
+       a++;
+       b++;
+       c++;
+       d++;
+   str = [[NSMutableString alloc]initWithString:@"haha"];
+       NSLog(@"2----------- a = %d,b = %d,c = %d,d = %d,str = %@",a,b,c,d,str);
+       blk();
+       
+       return 0;
+   }
+   ```
+
+   转成  c++ 代码：
+
+   ```objective-c
+   struct __block_impl {
+     void *isa;
+     int Flags;
+     int Reserved;
+     void *FuncPtr;
+   };
+   
+   int a = 1; // <------------------- NOTE
+   static int b = 2; // <------------------- NOTE
+   struct __main_block_impl_0 {
+     struct __block_impl impl;
+     struct __main_block_desc_0* Desc;
+     int *d;						// <------------------- NOTE
+     NSMutableString *str;				// <------------------- NOTE
+     int c; // <------------------- NOTE
+     __main_block_impl_0(void *fp, struct __main_block_desc_0 *desc, int *_d, NSMutableString *_str, int _c, int flags=0) : d(_d), str(_str), c(_c) {
+       impl.isa = &_NSConcreteStackBlock;
+       impl.Flags = flags;
+       impl.FuncPtr = fp;
+       Desc = desc;
+     }
+   };
+   
+   static void __main_block_func_0(struct __main_block_impl_0 *__cself) {
+     int *d = __cself->d; // bound by copy
+     NSMutableString *str = __cself->str; // bound by copy
+     int c = __cself->c; // bound by copy
+   
+           a++;
+           b++;
+           (*d)++;
+           ((void (*)(id, SEL, NSString *))(void *)objc_msgSend)((id)str, sel_registerName("appendString:"), (NSString *)&__NSConstantStringImpl__var_folders_7__3g67htjj4816xmx7ltbp2ntc0000gn_T_main_150b21_mi_1);
+           NSLog((NSString *)&__NSConstantStringImpl__var_folders_7__3g67htjj4816xmx7ltbp2ntc0000gn_T_main_150b21_mi_2,a,b,c,(*d),str);
+       }
+   static void __main_block_copy_0(struct __main_block_impl_0*dst, struct __main_block_impl_0*src) {_Block_object_assign((void*)&dst->str, (void*)src->str, 3/*BLOCK_FIELD_IS_OBJECT*/);}
+   
+   static void __main_block_dispose_0(struct __main_block_impl_0*src) {_Block_object_dispose((void*)src->str, 3/*BLOCK_FIELD_IS_OBJECT*/);}
+   
+   static struct __main_block_desc_0 {
+     size_t reserved;
+     size_t Block_size;
+     void (*copy)(struct __main_block_impl_0*, struct __main_block_impl_0*);
+     void (*dispose)(struct __main_block_impl_0*);
+   } __main_block_desc_0_DATA = { 0, sizeof(struct __main_block_impl_0), __main_block_copy_0, __main_block_dispose_0};
+   
+   int main(int argc, const char * argv[]) {
+       int c = 3;
+       static int d = 4;
+       NSMutableString *str = ((NSMutableString *(*)(id, SEL, NSString *))(void *)objc_msgSend)((id)((NSMutableString *(*)(id, SEL))(void *)objc_msgSend)((id)objc_getClass("NSMutableString"), sel_registerName("alloc")), sel_registerName("initWithString:"), (NSString *)&__NSConstantStringImpl__var_folders_7__3g67htjj4816xmx7ltbp2ntc0000gn_T_main_150b21_mi_0);
+       void (*blk)(void) = ((void (*)())&__main_block_impl_0((void *)__main_block_func_0, &__main_block_desc_0_DATA, &d, str, c, 570425344));
+   
+       a++;
+       b++;
+       c++;
+       d++;
+       str = ((NSMutableString *(*)(id, SEL, NSString *))(void *)objc_msgSend)((id)((NSMutableString *(*)(id, SEL))(void *)objc_msgSend)((id)objc_getClass("NSMutableString"), sel_registerName("alloc")), sel_registerName("initWithString:"), (NSString *)&__NSConstantStringImpl__var_folders_7__3g67htjj4816xmx7ltbp2ntc0000gn_T_main_150b21_mi_3);
+       NSLog((NSString *)&__NSConstantStringImpl__var_folders_7__3g67htjj4816xmx7ltbp2ntc0000gn_T_main_150b21_mi_4,a,b,c,d,str);
+       ((void (*)(__block_impl *))((__block_impl *)blk)->FuncPtr)((__block_impl *)blk);
+   
+       return 0;
+   }
+   ```
+
+   
+
 4. `block`在修改`NSMutableArray`，需不需要添加`__block`
+
+   不需要，本身 block 内部就捕获了 NSMutableArray 指针，除非你要修改指针指向的对象，而这里明显只是修改内存数据，这个可以类比 NSMutableString。
+
 5. 怎么进行内存管理的
+
+   `static void *_Block_copy_internal(const void *arg, const int flags)` 和 `void _Block_release(void *arg) `
+
+   > 推荐[iOS Block原理探究以及循环引用的问题](https://www.jianshu.com/p/9ff40ea1cee5) 一文。
+
 6. `block`可以用`strong`修饰吗
+
+   ARC 貌似是可以的， strong 和 copy 的操作都是将栈上block 拷贝到堆上。TODO：确认下。
+
 7. 解决循环引用时为什么要用`__strong、__weak`修饰
+
+   `__weak` 就是为了避免 retainCycle，而block 内部 `__strong` 则是在作用域 retain 持有当前对象做一些操作，结束后会释放掉它。
+
 8. `block`发生`copy`时机
+
+   block 从栈上拷贝到堆上几种情况：
+
+   * 调用Block的copy方法
+
+   * 将Block作为函数返回值时
+
+   * 将Block赋值给__strong修饰的变量或Block类型成员变量时
+
+   * 向Cocoa框架含有usingBlock的方法或者GCD的API传递Block参数时
+
 9. `Block`访问对象类型的`auto变量`时，在`ARC和MRC`下有什么区别
 
 # 多线程
