@@ -352,10 +352,14 @@
 
 14. KVO使用时要注意什么？
 
-    1. 移除监听.在dealloc方法中移除；
+    1. 移除监听.在dealloc方法中移除，简单解决方案：创建一个中间对象，将其作为某个属性的观察者，然后dealloc的时候去做移除观察者，而调用者是持有中间对象的，调用者释放了，中间对象也释放了，dealloc 也就移除观察者了；
     2. 当你在同一个ViewController中添加多个KVO的时候，无论哪个KVO都是走同一个回调方法。所以需要对想要的监听对象进行区分,以便指定不同的逻辑，比如通过对象指针比较，或者通过 context，更好的方式就是自己来封装一个[中间件](https://github.com/colourful987/2018-Read-Record/blob/master/Content/iOS/THObserversAndBinders/如何实现一个优雅的KVO和KVB中间件.md)，《如何实现一个优雅的KVO和KVB中间件》；
     3. 把监听到对象的属性值改变赋值的时候，一定要注意监听对象的值的类型；
     4. 如果监听一个对象的多个属性，任何一个属性的改变都会走代理方法，也就是说对属性的监听，是分开执行的；
+    5. 多次重复移除同一个属性，移除了未注册的观察者会导致崩溃
+    6. 被观察者提前被释放，被观察者在 dealloc 时仍然注册着 KVO，导致崩溃。 例如：被观察者是局部变量的情况（iOS 10 及之前会崩溃） 比如 weak ；
+    7. 添加了观察者，但未实现 `observeValueForKeyPath:ofObject:change:context:`方法，导致崩溃；
+    8. 添加或者移除时 `keypath == nil`，导致崩溃；
 
 15. KVO的观察者如果为weak，会有什么影响？
 
@@ -363,7 +367,7 @@
 
 16. 如何实现多代理？
 
-    > TODO: NSProxy 实现方式。
+    > NSProxy 相关见 Q23
 
     方法一
 
@@ -1006,3 +1010,299 @@
     结论是runloop很多方法中其实隐式的会创建一些 autoreleasepool，所以大可不必担心。
 
 23. NSProxy 是什么？可以用来干嘛。
+
+    > [NSProxy的理解和使用](https://juejin.im/post/5afbca7bf265da0b8c25251d)，强烈推荐该文，对理解 NSProxy 有很大帮助。下面三个例子出自该文
+
+    > NSProxy是一个抽象的超类，它定义了一个对象的API，用来充当其他对象或者一些不存在的对象的替身。通常，发送给Proxy的消息会被转发给实际对象，或使Proxy加载（转化为）实际对象。 NSProxy的子类可以用于实现透明的分布式消息传递(例如，NSDistantObject)，或者用于创建开销较大的对象的惰性实例化。
+
+    **1. 模拟多继承**
+
+    ```objective-c
+    @interface TargetProxy : NSProxy
+     {
+         id realObject1;
+         id realObject2;
+     }
+     -(id)initWithTarget1:(id)t1 target:(id)t2;
+     
+     @end
+     
+     @implementation TargetProxy
+     
+     -(id)initWithTarget1:(id)t1 target:(id)t2
+     {
+           realObject1 = t1;
+           realObject2 = t2;
+           return self;
+     }
+     -(void)forwardInvocation:(NSInvocation *)invocation
+     {
+            id target = [realObject1 methodSignatureForSelector:invocation.selector]?realObject1:realObject2;
+            [invocation invokeWithTarget:target];
+     }
+     -(NSMethodSignature *)methodSignatureForSelector:(SEL)sel
+     {
+          NSMethodSignature *signature;
+          signature = [realObject1 methodSignatureForSelector:sel];
+          if (signature) {
+               return signature;
+          }
+          signature = [realObject2 methodSignatureForSelector:sel];
+          return signature;
+     }
+     -(BOOL)respondsToSelector:(SEL)aSelector
+     {
+          if ([realObject1 respondsToSelector:aSelector]) {
+             return YES;
+          }
+          if ([realObject2 respondsToSelector:aSelector]) {
+             return YES;
+           }
+         return NO;
+     }
+     @end
+     
+     使用案例：
+     NSMutableArray *array = [NSMutableArray array];
+     NSMutableString *string = [NSMutableString string];
+     
+     id proxy = [[TargetProxy alloc]initWithTarget1:array target:string];
+     [proxy appendString:@"This "];
+     
+     [proxy appendString:@"is "];
+     [proxy addObject:string];
+     [proxy appendString:@"a "];
+     [proxy appendString:@"test!"];
+      NSLog(@"count should be 1,it is:%ld",[proxy count]);
+     if ([[proxy objectAtIndex:0] isEqualToString:@"This is a test!"]) {
+         NSLog(@"Appending successful: %@",proxy);
+     }else
+     {
+         NSLog(@"Appending failed, got: %@", proxy);
+     }
+         NSLog(@"Example finished without errors.");
+    ```
+
+    **2. NSTimer 循环引用问题**
+
+    ```objective-c
+    #import <Foundation/Foundation.h>
+     
+     NS_ASSUME_NONNULL_BEGIN
+    
+    @interface YYWeakProxy : NSProxy
+    
+    @property (nullable, nonatomic, weak, readonly) id target;
+    
+    - (instancetype)initWithTarget:(id)target;
+    
+    + (instancetype)proxyWithTarget:(id)target;
+    
+    @end
+    
+    NS_ASSUME_NONNULL_END
+     
+     #import "YYWeakProxy.h"
+     
+     
+    @implementation YYWeakProxy
+    
+    - (instancetype)initWithTarget:(id)target {
+        _target = target;
+        return self;
+    }
+    
+    + (instancetype)proxyWithTarget:(id)target {
+        return [[YYWeakProxy alloc] initWithTarget:target];
+    }
+    
+    - (id)forwardingTargetForSelector:(SEL)selector {
+        return _target;
+    }
+    
+    - (void)forwardInvocation:(NSInvocation *)invocation {
+       void *null = NULL;
+       [invocation setReturnValue:&null];
+    }
+    
+    - (NSMethodSignature *)methodSignatureForSelector:(SEL)selector {
+        return [NSObject instanceMethodSignatureForSelector:@selector(init)];
+    }
+    
+    - (BOOL)respondsToSelector:(SEL)aSelector {
+        return [_target respondsToSelector:aSelector];
+    }
+    
+    - (BOOL)isEqual:(id)object {
+        return [_target isEqual:object];
+    }
+    
+    - (NSUInteger)hash {
+        return [_target hash];
+    }
+    
+    - (Class)superclass {
+        return [_target superclass];
+    }
+    
+    - (Class)class {
+        return [_target class];
+    }
+    
+    - (BOOL)isKindOfClass:(Class)aClass {
+        return [_target isKindOfClass:aClass];
+    }
+    
+    - (BOOL)isMemberOfClass:(Class)aClass {
+        return [_target isMemberOfClass:aClass];
+    }
+    
+    - (BOOL)conformsToProtocol:(Protocol *)aProtocol {
+        return [_target conformsToProtocol:aProtocol];
+    }
+    
+    - (BOOL)isProxy {
+        return YES;
+    }
+    
+    - (NSString *)description {
+        return [_target description];
+    }
+    
+    - (NSString *)debugDescription {
+        return [_target debugDescription];
+    }
+    
+    @end
+    
+     
+     @end
+    使用案例：
+     - (void)initTimer {
+        YYWeakProxy *proxy = [YYWeakProxy proxyWithTarget:self];
+        _timer = [NSTimer timerWithTimeInterval:0.1 target:proxy selector:@selector(tick:) userInfo:nil repeats:YES];
+     }
+    //至于具体的原理，让NSTimer定时中的方法由YYWeakProxy转发给VC执行.但是NStimer持有的却不是VC.这样就不会循环引用.
+    ```
+
+    
+
+    **3. 多代理**
+
+    ```objective-c
+    #import <Foundation/Foundation.h>
+     
+     @protocol TeacherProtocol <NSObject>
+     - (void)beginTeachering;
+     @end
+     
+     @interface Teacher : NSObject
+     
+     @end
+    
+     #import "Teacher.h"
+     
+     @implementation Teacher
+     
+     -(void)beginTeachering
+     {
+         NSLog(@"%s",__func__);
+     }
+     @end
+    
+     #import <Foundation/Foundation.h>
+     
+     @protocol StudentProtocol <NSObject>
+      - (void)beginLearning;
+     @end
+     
+     
+     @interface Student : NSObject
+     @end
+     
+     #import "Student.h"
+     
+     @implementation Student
+     
+     -(void)beginLearning
+     {
+         NSLog(@"%s",__func__);
+     }
+     @end
+    
+     #import <Foundation/Foundation.h>
+     #import "Teacher.h"
+     #import "Student.h"
+     
+     @interface JSDistProxy : NSProxy<TeacherProtocol,StudentProtocol>
+     +(instancetype)sharedInstance;
+     -(void)registerMethodWithTarget:(id)target;
+     @end
+    
+     #import "JSDistProxy.h"
+     #import <objc/runtime.h>
+     
+     @interface JSDistProxy ()
+     @property(nonatomic,strong) NSMutableDictionary *selectorMapDic;
+     @end
+     
+     
+     @implementation JSDistProxy
+     
+     +(instancetype)sharedInstance
+     {
+        static JSDistProxy *proxy;
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+           proxy = [JSDistProxy alloc];
+           proxy.selectorMapDic = [NSMutableDictionary dictionary];
+        });
+         return proxy;
+     }
+     -(void)registerMethodWithTarget:(id)target
+     {
+         unsigned int count = 0;
+         Method *methodList = class_copyMethodList([target class], &count);
+         for (int i=0; i<count; i++) {
+              Method method = methodList[i];
+              SEL selector = method_getName(method);
+              const char *method_name = sel_getName(selector);
+             [self.selectorMapDic setValue:target forKey:[NSString stringWithUTF8String:method_name]];
+         }
+         free(methodList);
+     }
+     
+     -(NSMethodSignature *)methodSignatureForSelector:(SEL)sel
+     {
+           NSString *methodStr = NSStringFromSelector(sel);
+           if ([self.selectorMapDic.allKeys containsObject:methodStr]) {
+           		 id target = self.selectorMapDic[methodStr];
+               return [target methodSignatureForSelector:sel];
+            }
+           return [super methodSignatureForSelector:sel];
+     }
+     -(void)forwardInvocation:(NSInvocation *)invocation
+     {
+            NSString *methodName = NSStringFromSelector(invocation.selector);
+            if ([self.selectorMapDic.allKeys containsObject:methodName]) {
+                id target = self.selectorMapDic[methodName];
+                [invocation invokeWithTarget:target];
+            }else
+            {
+                [super forwardInvocation:invocation];
+             }
+     }
+    
+     @end
+     使用案例：
+     JSDistProxy *proxy = [JSDistProxy sharedInstance];
+     Teacher *teacher = [Teacher new];
+     Student *student = [Student new];
+     [proxy registerMethodWithTarget:teacher];
+     [proxy registerMethodWithTarget:student];
+     
+     [proxy beginLearning];
+     [proxy beginTeachering];
+    ```
+
+    > 这个实现还是很秀的。
