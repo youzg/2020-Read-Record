@@ -924,15 +924,172 @@ void _object_set_associative_reference(id object, void *key, id value, uintptr_t
 4. `PerformSelector`和`runloop`的关系
 5. 如何使线程保活
 
-## KVO
+## KVO（Finished）
 
 同`runloop`一样，这也是标配的知识点了，同样列出几个典型问题
 
-1. 实现原理
-2. 如何手动关闭kvo
-3. 通过KVC修改属性会触发KVO么
-4. 哪些情况下使用kvo会崩溃，怎么防护崩溃
-5. kvo的优缺点
+### 1. 实现原理
+
+KVO 会为需要observed的对象动态创建一个子类，以`NSKVONotifying_` 最为前缀，然后将对象的 isa 指针指向新的子类，同时重写 class 方法，返回原先类对象，这样外部就无感知了；其次重写所有要观察属性的setter方法，统一会走一个方法，然后内部是会调用 `willChangeValueForKey` 和 `didChangevlueForKey` 方法，在一个被观察属性发生改变之前， `willChangeValueForKey:`一定会被调用，这就 会记录旧的值。而当改变发生后，`didChangeValueForKey:`会被调用，继而 `observeValueForKey:ofObject:change:context:` 也会被调用。
+
+![图片出处https://juejin.im/post/5adab70cf265da0b736d37a8](/Users/pmst/Source Code Repositories/2020-Read-Record/topics/面经解题集合/res/kvo.png)
+
+那么如何验证上面的说法呢？很简单，借助runtime 即可，测试代码请点击[这里](https://github.com/colourful987/2020-Read-Record/tree/master/samples/02-25-KVO):
+
+```objective-c
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.person = [[Person alloc] initWithName:@"pmst" age:18];
+    self.teacher = [[Teacher alloc] initWithName:@"ppp" age:28];
+    self.teacher.work = @"数学";
+    self.teacher.numberOfStudent = 10;
+    
+    NSKeyValueObservingOptions options = NSKeyValueObservingOptionNew | NSKeyValueObservingOptionOld;
+    
+    RuntimeUtil *utils = [RuntimeUtil new];
+    [utils logClassInfo:self.person.class];
+    [self.person addObserver:self forKeyPath:@"age" options:options context:nil];
+    [utils logClassInfo:object_getClass(self.person)];
+    
+    
+    [utils logClassInfo:self.teacher.class];
+    [self.teacher addObserver:self forKeyPath:@"age" options:options context:nil];
+    [self.teacher addObserver:self forKeyPath:@"name" options:options context:nil];
+    [self.teacher addObserver:self forKeyPath:@"work" options:options context:nil];
+    [utils logClassInfo:object_getClass(self.teacher)];
+}
+```
+
+这里 `object_getClass()` 方法实现也贴一下，如果直接使用 `.class` 那么因为被重写过，返回的还是原先对象的类对象，而直接用 runtime 方法的直接返回了 `isa` 指针。
+
+```objective-c
+Class object_getClass(id obj)
+{
+    if (obj) return obj->getIsa();
+    else return Nil;
+}
+```
+
+通过日志确实可以看到子类重写了对应属性的setter方法：
+
+```shell
+2020-03-25 23:11:00.607820+0800 02-25-KVO[28370:1005147] LOG:(NSKVONotifying_Teacher) INFO
+2020-03-25 23:11:00.608190+0800 02-25-KVO[28370:1005147] ==== OUTPUT:NSKVONotifying_Teacher properties ====
+2020-03-25 23:11:00.608529+0800 02-25-KVO[28370:1005147] ==== OUTPUT:NSKVONotifying_Teacher Method ====
+2020-03-25 23:11:00.608876+0800 02-25-KVO[28370:1005147] method name:setWork:
+2020-03-25 23:11:00.609219+0800 02-25-KVO[28370:1005147] method name:setName:
+2020-03-25 23:11:00.646713+0800 02-25-KVO[28370:1005147] method name:setAge:
+2020-03-25 23:11:00.646858+0800 02-25-KVO[28370:1005147] method name:class
+2020-03-25 23:11:00.646971+0800 02-25-KVO[28370:1005147] method name:dealloc
+2020-03-25 23:11:00.647088+0800 02-25-KVO[28370:1005147] method name:_isKVOA
+2020-03-25 23:11:00.647207+0800 02-25-KVO[28370:1005147] =========================
+```
+
+>  疑惑点：看到有文章提出 KVO 之后，setXXX 方法转而调用 `_NSSetBoolValueAndNotify、_NSSetCharValueAndNotify、_NSSetFloatValueAndNotify、_NSSetLongValueAndNotify` 等方法，但是通过 runtime 打印 method 是存在的，猜测 SEL 是一样的，但是 IMP 被换掉了，关于源码的实现还未找到。TODO下。
+
+### 2. 如何手动关闭kvo
+
+> KVO 和 KVC 相关接口太多，实际开发中直接查看接口文档即可。
+
+```objective-c
++(BOOL)automaticallyNotifiesObserversForKey:(NSString *)key{
+    if ([key isEqualToString:@"name"]) {
+        return NO;
+    }else{
+        return [super automaticallyNotifiesObserversForKey:key];
+    }
+}
+
+-(void)setName:(NSString *)name{
+    
+    if (_name!=name) {
+        
+        [self willChangeValueForKey:@"name"];
+        _name=name;
+        [self didChangeValueForKey:@"name"];
+    }
+      
+}
+```
+
+### 3. 通过KVC修改属性会触发KVO么
+
+会触发 KVO 操作，KVC 时候会先查询对应的 getter 和 setter 方法，如果都没找到，调用 
+
+```objective-c
++ (BOOL)accessInstanceVariablesDirectly {
+    return NO;
+}
+```
+
+如果返回 YES，那么可以直接修改实例变量。
+
+* KVC 调用 getter 流程：`getKEY，KEY，isKEY, _KEY`，接着是实例变量 `_KEY,_isKEY, KEY, isKEY`;
+
+* KVC 调用 setter 流程：`setKEY`和 `_setKEY`，实例变量顺序 `_KEY,_isKEY, KEY, isKEY`，没找到就调用 `setValue: forUndefinedKey:`
+
+![](./res/setkey_procedure.jpg)
+
+![](./res/getter_procedure.jpg)
+
+### 4. 哪些情况下使用kvo会崩溃，怎么防护崩溃
+
+1. dealloc 没有移除 kvo 观察者，解决方案：创建一个中间对象，将其作为某个属性的观察者，然后dealloc的时候去做移除观察者，而调用者是持有中间对象的，调用者释放了，中间对象也释放了，dealloc 也就移除观察者了；
+2. 多次重复移除同一个属性，移除了未注册的观察者
+3. 被观察者提前被释放，被观察者在 dealloc 时仍然注册着 KVO，导致崩溃。 例如：被观察者是局部变量的情况（iOS 10 及之前会崩溃） 比如 weak ；
+4. 添加了观察者，但未实现 `observeValueForKeyPath:ofObject:change:context:`方法，导致崩溃；
+5. 添加或者移除时 `keypath == nil`，导致崩溃；
+
+> 以下解决方案出自 [iOS 开发：『Crash 防护系统』（二）KVO 防护](https://juejin.im/post/5d67b720f265da039a289bb4) 一文。
+
+**解决方案一：**
+
+FBKVOController 对 KVO 机制进行了额外的一层封装，框架不但可以自动帮我们移除观察者，还提供了 block 或者 selector 的方式供我们进行观察处理。不可否认的是，FBKVOController 为我们的开发提供了很大的便利性。但是相对而言，这种方式对项目代码的侵入性比较大，必须依靠编码规范来强制约束团队人员使用这种方式。
+
+**解决方案二：**
+
+1. 首先为 NSObject 建立一个分类，利用 Method Swizzling，实现自定义的 `BMP_addObserver:forKeyPath:options:context:`、`BMP_removeObserver:forKeyPath:`、`BMP_removeObserver:forKeyPath:context:`、`BMPKVO_dealloc`方法，用来替换系统原生的添加移除观察者方法的实现。
+
+2. 然后在观察者和被观察者之间建立一个 `KVODelegate 对象`，两者之间通过 `KVODelegate 对象` 建立联系。然后在添加和移除操作时，将 KVO 的相关信息例如 `observer`、`keyPath`、`options`、`context` 保存为 `KVOInfo 对象`，并添加到 `KVODelegate 对象` 中对应 的 `关系哈希表` 中，对应原有的添加观察者。 关系哈希表的数据结构：`{keypath : [KVOInfo 对象1, KVOInfo 对象2, ... ]}`
+
+3. 在添加和移除操作的时候，利用 `KVODelegate 对象` 做转发，把真正的观察者变为 `KVODelegate 对象`，而当被观察者的特定属性发生了改变，再由 `KVODelegate 对象` 分发到原有的观察者上。
+
+1. **添加观察者时**：通过关系哈希表判断是否重复添加，只添加一次。
+2. **移除观察者时**：通过关系哈希表是否已经进行过移除操作，避免多次移除。
+3. **观察键值改变时**：同样通过关系哈希表判断，将改变操作分发到原有的观察者上。
+
+**解决方案三：**
+
+**XXShield** 实现方案和 BayMax 系统类似。也是利用一个 Proxy 对象用来做转发， 真正的观察者是 Proxy，被观察者出现了通知信息，由 Proxy 做分发。不过不同点是 Proxy 里面保存的内容没有前者多。只保存了 `_observed（被观察者）` 和关系哈希表，这个关系哈希表中只维护了 `keyPath` 和 `observer` 的关系。
+
+关系哈希表的数据结构：`{keypath : [observer1, observer2 , ...](NSHashTable)}` 。
+
+XXShield 在 dealloc 中也做了类似将多余观察者移除掉的操作，是通过关系数据结构和 `_observed` ，然后调用原生移除观察者操作实现的。
+
+### 5. kvo的优缺点
+
+优点：
+
+1. 运用了设计模式：**观察者模式**
+2. 支持**多个观察者观察同一属性**，或者**一个观察者监听不同属性**。
+3. 开发人员不需要实现属性值变化了发送通知的方案，系统已经封装好了，大大减少开发工作量；
+4. 能够对非我们创建的对象，即内部对象的状态改变作出响应，而且不需要改变内部对象（SDK对象）的实现；
+5. 能够提供观察的属性的最新值以及先前值；
+6. 用key paths来观察属性，因此也可以观察嵌套对象；
+7. 完成了对观察对象的抽象，因为不需要额外的代码来允许观察值能够被观察
+
+缺点：
+
+1. 观察的属性键值硬编码（字符串），编译器不会出现警告以及检查；
+2. 由于允许对一个对象进行不同属性观察，所以在唯一回调方法中，会出现地狱式 `if-else if - else` 分支处理情况；
+
+> References：
+>
+> * [iOS底层原理总结篇-- 深入理解 KVC\KVO 实现机制](https://juejin.im/post/5c2189dee51d454517589c8b)
+> * [iOS 开发：『Crash 防护系统』（二）KVO 防护](https://juejin.im/post/5d67b720f265da039a289bb4)
+> *  [ValiantCat](https://github.com/ValiantCat) / **[XXShield](https://github.com/ValiantCat/XXShield)**（第三方框架）
+> *  [JackLee18](https://github.com/JackLee18) / **[JKCrashProtect](https://github.com/JackLee18/JKCrashProtect)**（第三方框架）
+> * [大白健康系统 -- iOS APP运行时 Crash 自动修复系统](https://neyoufan.github.io/2017/01/13/ios/BayMax_HTSafetyGuard)
 
 # Block
 
